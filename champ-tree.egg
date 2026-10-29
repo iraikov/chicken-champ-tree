@@ -1,0 +1,11 @@
+;;;; -*- Scheme -*-
+
+((synopsis "A persistent unordered dictionary data structure based on CHAMP tries.")
+ (license "GPL-3")
+ (category data)
+ (dependencies datatype matchable yasos srfi-1 srfi-69)
+ (test-dependencies test srfi-1 srfi-69)
+ (author "Ivan Raikov")
+ (components (extension champ-tree))
+ )
+
