@@ -1,17 +1,11 @@
 ;;
 ;; CHAMP tree (Compressed Hash-Array Mapped Prefix-tree)
 ;;
-;; An implementation of an unordered persistent dictionary data
-;; structure, based on CHAMP tries (Steindorfer & Vinju, "Optimizing
-;; Hash-Array Mapped Tries for Fast and Lean Immutable JVM
-;; Collections", OOPSLA 2015), a memory- and iteration-friendly
-;; variant of a HAMT (Bagwell's Hash Array Mapped Trie).
-;;
-;; This library is a sibling of chicken-rbtree: it exposes the same
-;; style of Yasos-object persistent-map interface, but is backed by a
-;; hash trie instead of a red-black tree, so lookups, insertions and
-;; deletions are O(1) on average (bounded by a small constant trie
-;; depth) instead of O(log n), at the cost of giving up key ordering.
+;; An unordered persistent dictionary backed by a CHAMP trie
+;; (Steindorfer & Vinju, "Optimizing Hash-Array Mapped Tries for Fast
+;; and Lean Immutable JVM Collections", OOPSLA 2015), the memory- and
+;; iteration-friendly variant of a HAMT. Lookup, insertion and
+;; deletion take time proportional to a small constant trie depth.
 ;;
 ;; Copyright 2026 Ivan Raikov.
 ;;
@@ -56,48 +50,28 @@
 ;;
 ;; Persistent map operations
 ;;
-;; A persistent-unordered-map provides the operations provided by
-;; yasos-collections, plus the following operations:
+;; A persistent-unordered-map provides the yasos-collections
+;; operations plus:
 ;;
-;;	get
+;;	get KEY . DEFAULT-CLAUSE
+;;		the (key . value) pair for KEY, or the result of
+;;		DEFAULT-CLAUSE if absent (an error if omitted).
 ;;
-;;		procedure LAMBDA KEY . DEFAULT-CLAUSE which searches
-;;		the given map for an association with a given KEY, and
-;;		returns a (key . value) pair of the found association.
-;;		If an association with the KEY cannot be located,
-;;		the PROC returns the result of evaluating the
-;;		DEFAULT-CLAUSE.  If the default clause is omitted, an
-;;		error is signalled.
-;;
-;;	for-each-assoc
-;;
-;;		a procedure LAMBDA PROC that applies PROC to every
-;;		(key . value) association in the map, in the trie's
-;;		own layout order (lowest bitmap bit first at each
-;;		node, inlined data entries before sub-node entries).
-;;		This order is unspecified relative to the keys'
-;;		values, but is deterministic for a given final set of
-;;		associations: because CHAMP tries are kept in
-;;		canonical form, two maps with the same associations
-;;		have the identical trie shape regardless of the
-;;		sequence of put/delete operations used to build them,
-;;		and therefore traverse in the same order.
+;;	for-each-assoc PROC
+;;		applies PROC to every (key . value) association, in
+;;		the trie's own layout order. That order is unrelated
+;;		to key values, but is the same for any two maps with
+;;		the same associations, since CHAMP's canonical form
+;;		gives them the same trie shape regardless of how they
+;;		were built.
 ;;
 ;;	gen-assoc
+;;		a generator of every (key . value) association, in
+;;		the same order as for-each-assoc, returning an
+;;		end-of-file object when exhausted.
 ;;
-;;		a procedure LAMBDA () that returns a generator of
-;;		every (key . value) association in the map, in the
-;;		same order as for-each-assoc.  The generator returns
-;;		an end-of-file object when exhausted.
-;;
-;;	map-key-hash
-;;
-;;		returns the key-hash procedure the map was created
-;;		with.
-;;
-;;	map-key-equal
-;;
-;;		returns the key-equal procedure the map was created
+;;	map-key-hash, map-key-equal
+;;		the key-hash/key-equal procedures the map was created
 ;;		with.
 ;;
 
@@ -133,11 +107,10 @@
 ;; Bitmap / hash-chunk constants and helpers
 ;;
 
-;; 5 bits per trie level (32-way branching).  A key's hash is masked
-;; to 32 bits and consumed 5 bits at a time; +max-depth+ is the depth
-;; at which the 32-bit hash is exhausted, past which two distinct
-;; hashes can no longer be distinguished by any chunk and must be
-;; resolved by a collision-node instead of further branching.
+;; 5 bits per trie level (32-way branching); a key's hash is masked to
+;; 32 bits and consumed 5 bits at a time. +max-depth+ is the depth at
+;; which the hash is exhausted, beyond which two distinct hashes are
+;; resolved by a collision-node.
 (define +bits-per-level+ 5)
 (define +level-mask+     #x1F)
 (define +hash-mask+      #xFFFFFFFF)
@@ -148,9 +121,7 @@
 (define (hash-chunk h depth)
   (fxand (fxshr h (fx* +bits-per-level+ depth)) +level-mask+))
 
-;; A 256-entry byte-popcount lookup table, built once at module load
-;; (the idea is borrowed from the iset egg's own byte-oriented
-;; bit-count table, adapted here for packed 32-bit fixnums).
+;; 256-entry byte-popcount lookup table
 (define +byte-popcount-table+
   (let ((table (make-vector 256 0)))
     (do ((i 0 (fx+ i 1)))
@@ -185,24 +156,21 @@
 ;;
 ;; A bitmap-node has two disjoint 32-bit bitmaps: DATAMAP marks slots
 ;; holding an inlined (key . value) pair, NODEMAP marks slots holding
-;; a pointer to a child node one level deeper.  ARRAY is one flat
-;; vector: first the data run (2*popcount(datamap) elements, key/value
-;; interleaved, in increasing bit order), then the node run
-;; (popcount(nodemap) elements, in increasing bit order).
+;; a pointer to a child node one level deeper. ARRAY is one flat
+;; vector: the data run (2*popcount(datamap) elements, key/value
+;; interleaved, in bit order), then the node run (popcount(nodemap)
+;; elements, in bit order).
 ;;
 ;; A collision-node holds two or more (key . value) pairs whose hashes
-;; are fully equal (not merely equal through some depth); it can
-;; therefore appear at any depth, not only at +max-depth+ -- see
-;; two-entry-node below.
+;; are fully equal; it can appear at any depth, not only at
+;; +max-depth+ (see two-entry-node).
 ;;
 ;; The map's root is always one of three shapes: #f (empty), a bare
-;; (key . value) pair (exactly one association in the whole map), or a
-;; bitmap-node/collision-node with two or more associations.  This
-;; avoids a root/non-root special case in the canonical-form
-;; invariant: every bitmap-node that is NOT the root must never be a
-;; lone single-data-entry wrapper (popcount(datamap) = 1 and
-;; popcount(nodemap) = 0) -- such a node's one entry must instead be
-;; inlined directly into its parent's data run.
+;; (key . value) pair (one association), or a bitmap-node/
+;; collision-node with two or more. This keeps the canonical-form
+;; invariant uniform: a bitmap-node that is NOT the root must never
+;; hold exactly one inlined entry and no children; such an entry is
+;; inlined into its parent's data run instead.
 
 (define-record-type bitmap-node
   (BitmapNode datamap nodemap array)
@@ -240,19 +208,21 @@
     (display ")" out)))
 
 
-;;
-;; Small vector-splice helper used throughout insert/delete/union:
-;; returns a new vector equal to VEC with COUNT elements starting at
-;; POS removed and the elements of INSERT-LIST spliced in at POS.
-;; Used for plain removal (insert-list = '()), plain insertion
-;; (count = 0), and same-size in-place-looking replacement
-;; (count = (length insert-list)); the node arrays are always small
-;; (at most 64 elements), so building the result via vector-append is
-;; simple and fast enough.
+;; Returns a new vector equal to VEC with COUNT elements starting at
+;; POS removed and INSERT-LIST spliced in at POS: plain removal
+;; (insert-list = '()), insertion (count = 0), or replacement
+;; (count = (length insert-list)). Makes one allocation and blits the
+;; unchanged ranges with vector-copy!.
 (define (vector-splice vec pos count insert-list)
-  (vector-append (vector-copy vec 0 pos)
-		  (list->vector insert-list)
-		  (vector-copy vec (fx+ pos count) (vector-length vec))))
+  (let* ((n (vector-length vec))
+	 (k (length insert-list))
+	 (new (make-vector (fx+ (fx- n count) k))))
+    (vector-copy! new 0 vec 0 pos)
+    (let loop ((i pos) (xs insert-list))
+      (if (null? xs)
+	  (vector-copy! new i vec (fx+ pos count) n)
+	  (begin (vector-set! new i (car xs)) (loop (fx+ i 1) (cdr xs)))))
+    new))
 
 (define (vector-copy-replace vec pos x)
   (let ((new (vector-copy vec)))
@@ -260,18 +230,12 @@
     new))
 
 
-;; Builds the smallest subtrie holding exactly two associations whose
-;; full (masked) hashes are H1 and H2, starting the search for a
-;; distinguishing chunk at DEPTH.  If H1 and H2 are fully equal, no
-;; depth of chunking can ever separate them, so a collision-node is
-;; returned immediately regardless of DEPTH -- this is what allows a
-;; collision-node to appear shallower than +max-depth+ (including, in
-;; the degenerate case of a two-key, fully-colliding map, as the map's
-;; own root).  Otherwise H1 and H2 are guaranteed to differ in some
-;; chunk at a depth <= +max-depth+ - 1 = 6, since they differ in some
-;; bit among the 32 masked bits and +max-depth+ levels of 5 bits cover
-;; all 32 bits; reaching +max-depth+ with H1 still /= H2 therefore
-;; indicates an internal invariant violation, not a legitimate case.
+;; Builds the smallest subtrie holding two associations whose full
+;; hashes are H1 and H2, starting at DEPTH. If H1 and H2 are equal,
+;; returns a collision-node directly, at any depth. Otherwise they
+;; must diverge at some chunk at or before +max-depth+, since 32
+;; masked bits are fully covered by then; reaching +max-depth+ with H1
+;; /= H2 is an invariant violation.
 (define (two-entry-node depth h1 key1 value1 h2 key2 value2)
   (cond
    ((fx= h1 h2) (CollisionNode h1 (list (cons key1 value1) (cons key2 value2))))
@@ -289,21 +253,11 @@
 	(BitmapNode (fxior (fxshl 1 b1) (fxshl 1 b2)) 0 (vector key2 value2 key1 value1))))))))
 
 
-;; Separates an existing subtree (all of whose keys share the single
-;; hash EXISTING-HASH -- in practice always a collision-node, whose
-;; entries are by construction all hash-equal to each other) from one
-;; new (KEY2 . VALUE2) association whose hash H2 differs from
-;; EXISTING-HASH.  Unlike two-entry-node's same-bitmap two-key split,
-;; the two sides here land in DIFFERENT bitmaps (one data slot, one
-;; node slot) whenever their chunks first diverge, so there is no
-;; need to compare b1 and b2 to decide array order -- data and node
-;; runs are separate arrays-within-the-array regardless of which bit
-;; is numerically larger.  This is what lets node-insert place a
-;; genuinely new, differently-hashed key alongside an existing
-;; collision-node instead of erroring, which matters both for plain
-;; insert (a collision-node can sit at any depth, including the map's
-;; own root, per two-entry-node's shortcut above) and for the union
-;; engine's build-node-from-entries.
+;; Separates an existing subtree (all of whose keys share hash
+;; EXISTING-HASH) from one new (KEY2 . VALUE2) with a different hash
+;; H2. Unlike two-entry-node, the two sides land in different bitmaps
+;; (a data slot and a node slot) once their chunks diverge, so there
+;; is no need to compare b1 and b2 to order them.
 (define (split-node-vs-subtree depth existing-hash existing-subtree h2 key2 value2)
   (if (fx= depth +max-depth+)
       (champ-tree:error 'insert "distinct hashes still unresolved at max depth")
@@ -314,31 +268,19 @@
 	    (BitmapNode (fxshl 1 b2) (fxshl 1 b1) (vector key2 value2 existing-subtree))))))
 
 
-;;
-;; Adds a new association to a node, or replaces/merges the old value
-;; if the key was already present.  VALUE-MERGE is called as
-;; (value-merge new-value old-value); put uses (lambda (x ax) x),
-;; update uses the user's merge-fn, mirroring rb-tree's insert.
-;;
-;; node-insert is written in a more general form than plain
-;; put/update need, taking ON-NEW (called as (on-new key value) to
-;; produce the value to store when key is not already present) and
-;; ON-CONFLICT (called as (on-conflict key value old-value) to
-;; produce the value to store when key IS already present).  Plain
-;; insert (below) always passes on-new = (lambda (k v) v); the union
-;; engine (section 4) reuses node-insert as its insert-into-node
-;; primitive with a non-trivial on-new, so that a lone data entry from
-;; one side can be merged into the other side's subtree through
-;; on-left/on-right/on-both without duplicating this traversal logic.
+;; Adds an association to a node, or replaces/merges the old value if
+;; the key is already present. ON-NEW is called as (on-new key value)
+;; to produce the value to store for a new key; ON-CONFLICT is called
+;; as (on-conflict key value old-value) when the key is already
+;; present. Plain insert (below) passes on-new = (lambda (k v) v); the
+;; union code reuses node-insert with a non-trivial on-new, to merge a
+;; lone entry from one side into the other side's subtree.
 (define (node-insert key-hash key-equal on-new on-conflict node depth h key value)
   (if (collision-node? node)
       (if (not (fx= h (collision-node-hash node)))
-	  ;; KEY merely shares the chunk-prefix down to DEPTH with this
-	  ;; collision-node's keys, without being a full hash collision
-	  ;; with them -- a perfectly ordinary case (e.g. a collision-
-	  ;; node formed early via two-entry-node's full-hash shortcut,
-	  ;; followed by an unrelated key that happens to share only the
-	  ;; chunks visited so far), not an error.
+	  ;; KEY shares only the chunk-prefix down to DEPTH with this
+	  ;; collision-node's keys, not their full hash -- ordinary, not
+	  ;; an error.
 	  (split-node-vs-subtree depth (collision-node-hash node) node h key (on-new key value))
 	  (let ((entries (collision-node-entries node)))
 	    (let loop ((es entries) (acc '()))
@@ -384,7 +326,7 @@
 
 
 ;; Top-level insert, handling the three root shapes.  Returns the new
-;; root (never mutates ROOT).
+;; root.
 (define (insert key-hash key-equal value-merge root key value)
   (let ((h (mask32 (key-hash key))))
     (cond
@@ -428,35 +370,22 @@
     (and item (cdr item))))
 
 
+;; Deletes an association by key. Returns #f if not found, otherwise
+;; (deleted-item . new-root), where new-root reflects the deletion.
+;; Deletion is local to the root-to-leaf path: a child that collapses
+;; to a single entry is inlined into its parent's data run by the
+;; caller one level up.
 ;;
-;; Finds an association with a given key and deletes it.  Returns the
-;; (key . value) pair of the deleted association together with the
-;; new root, or #f if the key was not found.  Deletion is strictly
-;; local to the root-to-leaf path (no global rebalancing, unlike
-;; red-black deletion): a child that collapses to a canonical
-;; single-data-entry shape (or a collision-node that shrinks to a
-;; single entry) is inlined into its PARENT's data run by the caller,
-;; one level up, which is the only re-canonicalization step needed.
-;;
-;; node-delete returns #f if the key was not found in NODE, or a pair
-;; (deleted-item . new-node-or-replacement), where new-node-or-
-;; replacement is itself either a trie node (>= 2 entries remain in
-;; this subtree) or a bare (key . value) pair (exactly one entry
-;; remains in this subtree, signalling to the caller that it must be
-;; inlined), or #f (this subtree became empty, only possible for a
-;; node directly beneath a bitmap-node that had exactly this one child
-;; and no data entries of its own -- see the nodemap-bit branch below).
+;; node-delete returns #f if the key was not found in NODE, otherwise
+;; (deleted-item . replacement), where replacement is a trie node
+;; (>= 2 entries left), a bare (key . value) pair (exactly one entry
+;; left, signalling to the caller that it must inline it), or #f (the
+;; subtree is now empty).
 
-;; Builds the post-removal result for a bitmap-node from a fresh
-;; (DATAMAP, NODEMAP, ARRAY) triple that has already had the deleted
-;; entry or child spliced out.  Returns #f if nothing remains, a bare
-;; (key . value) pair if exactly one association remains -- signalling
-;; to the CALLER that it must inline that pair into its own data run,
-;; the same canonicalization step delete must perform whenever a
-;; subtree shrinks to a single entry -- or the bitmap-node itself when
-;; two or more associations remain.  Every site in node-delete that
-;; constructs a new bitmap-node after removing something goes through
-;; this helper, so the collapse check is never accidentally skipped.
+;; Builds the post-removal node from a (DATAMAP, NODEMAP, ARRAY)
+;; triple with the deleted entry or child already spliced out.
+;; Returns #f if nothing remains, a bare pair if exactly one
+;; association remains (for the caller to inline), or the node itself.
 (define (make-node-or-collapse datamap nodemap array)
   (cond
    ((and (fx= 0 datamap) (fx= 0 nodemap)) #f)
@@ -539,10 +468,7 @@
    (else (car default-clause))))
 
 
-;;
-;; Whole-trie association count, by brute-force walk (there is no
-;; cached size field on any node, the same O(n) `size` tradeoff
-;; rb-tree makes, kept consistent between the two libraries).
+;; Whole-trie association count.
 
 (define (get-size root)
   (cond
@@ -581,13 +507,10 @@
 ;; Traversal and generators
 ;;
 ;; Stack frames are either an (Assoc pair) ready to yield directly
-;; (the bare-pair singleton-root shape, or one entry at a time out of
-;; a collision-node), or a (Node node slot), a bitmap-node together
-;; with the next array index still to be visited.  This is the
-;; trie-stack analogue of rb-tree's BST-stack generator idiom: push-
-;; first descends into the next child before continuing past it,
-;; exactly as range-push-left descends into node-left before queuing
-;; node-right.
+;; (the bare-pair singleton root, or one entry at a time out of a
+;; collision-node), or a (Node node slot), a bitmap-node together
+;; with the next array index to visit. push-first descends into a
+;; child before continuing past it.
 
 (define-record-type assoc-frame
   (Assoc pair)
@@ -737,24 +660,19 @@
       )))
 
 
-;; A single, shared top-level procedure, not a fresh lambda built
-;; inside champ-tree-map/equal on every call: union-with/withi/
-;; transform require their two maps' key-hash procedures to be eq? to
-;; each other, and two maps independently built via
-;; champ-tree-map/equal must still satisfy that check.
+;; The default key-hash procedure for champ-tree-map/equal: returns
+;; the SRFI-69 hash of K. Defined once at top level so that two maps
+;; independently built via champ-tree-map/equal still share an eq?
+;; key-hash procedure, which union requires.
 (define (champ-tree-default-hash k) (hash k))
 
 (define (champ-tree-map/equal #!key (new-root (Empty)))
   (champ-tree-map champ-tree-default-hash equal? new-root: new-root))
 
 
-;;
-;; Debug validity checker.  Returns #t iff ROOT satisfies every CHAMP
-;; structural invariant: bitmap/array length and disjointness, hash-
-;; chunk correctness along every path, canonical form (no non-root
-;; node is a lone single-data-entry wrapper, no collision-node has
-;; fewer than 2 entries), no node past +max-depth+, and no duplicate
-;; keys anywhere in the whole trie.
+;; Debug validity checker. #t iff ROOT satisfies every CHAMP
+;; structural invariant: bitmap/array consistency, hash-chunk
+;; correctness, canonical form, depth bound, and no duplicate keys.
 
 (define (node-valid? key-hash key-equal node depth path-chunks is-root?)
   (cond
@@ -816,13 +734,11 @@
 
 
 ;;
-;; Structural map equality.  Two maps are equal iff they have the
-;; same set of (key . value) associations (values compared with
-;; equal?).  When both maps were built with the same key-hash/
-;; key-equal procedures (checked by eq? on the stored procedures),
-;; CHAMP's canonical form guarantees identical trie shape for
-;; identical contents, so root equality decides it; otherwise a
-;; linear fallback via GET is used.
+;; Structural map equality: #t iff M1 and M2 have the same set of
+;; (key . value) associations. When both maps share the same
+;; key-hash/key-equal procedures, root equality decides it directly,
+;; since CHAMP's canonical form gives equal contents equal shape;
+;; otherwise falls back to a linear check via GET.
 
 (define (champ-tree-map-equal? m1 m2)
   (if (and (eq? (map-key-hash m1) (map-key-hash m2))
@@ -840,46 +756,31 @@
 ;;
 ;; Union family
 ;;
-;; Unions of maps.  Each union takes two maps M1 and M2, created by
-;; champ-tree-map with key-hash/key-equal procedures that agree with
-;; each other (checked by eq? on the stored procedures, since a
-;; mismatch would silently corrupt structure rather than merely
-;; disorder results the way a key-compare mismatch would in rb-tree),
-;; and returns a new map whose domain is the union of their domains.
-;; The new map uses the key-hash/key-equal of M1.  The inputs are not
-;; modified.
+;; Each union takes two maps M1 and M2 with eq? key-hash/key-equal
+;; procedures (a mismatch would silently corrupt structure, so it is
+;; checked) and returns a new map over the union of their domains,
+;; using M1's key-hash/key-equal. Neither input is modified.
 ;;
 ;;  ((union-with MERGE-FN) M1 M2)
-;;
-;;	MERGE-FN :: x y -> value defines the value of a key that is
-;;	in both maps, where x is its value in M1 and y its value in M2.
+;;	MERGE-FN :: x y -> value resolves a key present in both maps,
+;;	x its value in M1 and y its value in M2.
 ;;
 ;;  ((union-withi MERGE-FN) M1 M2)
-;;
 ;;	as union-with, but MERGE-FN :: key x y -> value also receives
 ;;	the key.
 ;;
 ;;  ((union-transform FN MERGE-FN) M1 M2)
-;;
-;;	maps the value of every key in only one map through FN :: x ->
-;;	value, and the value of every key in both maps through
-;;	MERGE-FN :: x y -> value.  Returns a list (N M KT1 KT2), where
-;;	N is the number of keys in the new map M, KT1 is a list of (x
-;;	. value) pairs that relates each value x in M1 to its new value
-;;	in M, and KT2 is the corresponding list for M2.  A key in both
-;;	maps contributes a pair to both KT1 and KT2.  Unlike rb-tree's
-;;	union-transform, KT1/KT2's order is NOT guaranteed ascending by
-;;	key -- there is no key order in a hash map.  The order is
-;;	unspecified relative to key values, but deterministic for a
-;;	given pair of input maps and a given key-hash function, since
-;;	the underlying trie merge visits bits in a fixed order at every
-;;	level.
+;;	maps a key present in only one map through FN :: x -> value,
+;;	and a key in both through MERGE-FN :: x y -> value. Returns
+;;	(list N M KT1 KT2): N is the size of the new map M; KT1 relates
+;;	each value x in M1 to its new value in M as (x . value) pairs,
+;;	KT2 likewise for M2. A shared key contributes to both. KT1/KT2
+;;	order is unspecified relative to keys, but deterministic for a
+;;	given pair of inputs.
 
 ;; Returns a node structurally identical to NODE but with every value
-;; replaced by (transform key value).  Used for the "one side of the
-;; union is absent here" base case: every surviving entry still
-;; passes through on-left or on-right, even though there is nothing
-;; on the other side to merge against.
+;; replaced by (transform key value); used when one side of a union
+;; is absent and the other's entries still need on-left/on-right applied.
 (define (clone-node-values transform node)
   (cond
    ((not node) #f)
@@ -903,17 +804,11 @@
       (BitmapNode datamap nodemap new-array)))))
 
 
-;; Merges two bitmap-nodes bit by bit.  Every one of the 3x3 = 9
-;; (Absent/Data/Child) x (Absent/Data/Child) combinations is handled
-;; explicitly, falling through to an internal-error assertion for the
-;; impossible remainder.  Note that union never shrinks a subtree
-;; below the entry count of its larger input (on-left/on-right always
-;; pass every unique key through, on-both still produces one entry
-;; per overlapping key), so unlike delete, no canonicalization step is
-;; needed here: a child merge result can never collapse to a
-;; single-entry shape when both of its contributing sides already
-;; satisfy the non-root canonical-form invariant (each has >= 2
-;; entries, or is a collision-node with >= 2 entries).
+;; Merges two bitmap-nodes bit by bit, handling each of the 3x3
+;; (Absent/Data/Child) x (Absent/Data/Child) combinations explicitly.
+;; Unlike delete, no collapse-to-single-entry check is needed here:
+;; a merge never shrinks below the larger input's entry count, so a
+;; result can't drop below the two-or-more-entries invariant.
 (define (merge-bitmaps key-hash key-equal on-left on-right on-both n1 n2 depth)
   (let ((d1 (bitmap-node-datamap n1)) (m1 (bitmap-node-nodemap n1)) (a1 (bitmap-node-array n1))
 	(d2 (bitmap-node-datamap n2)) (m2 (bitmap-node-nodemap n2)) (a2 (bitmap-node-array n2)))
@@ -986,12 +881,9 @@
 ;; full list of (key . value) associations.
 (define (node->entries node) (reverse (let ((acc '())) (tree-for-each-assoc node (lambda (item) (set! acc (cons item acc)))) acc)))
 
-;; Merges two association lists by key-equal.  Every key unique to XS
-;; passes through ON-LEFT, every key unique to YS passes through
-;; ON-RIGHT, every key in both passes through ON-BOTH (key x y).
-;; Collision lists are expected to stay small (true full-hash
-;; collisions are rare), so the straightforward O(|xs|*|ys|) scan here
-;; is an acceptable, simple, and clearly-correct choice.
+;; Merges two association lists by key-equal: a key unique to XS
+;; passes through ON-LEFT, unique to YS through ON-RIGHT, and a key in
+;; both through ON-BOTH (key x y).
 (define (alist-merge key-equal on-left on-right on-both xs ys)
   (let* ((ys-only (let loop ((ys ys) (acc '()))
 		    (cond
@@ -1008,10 +900,9 @@
     (append left+both right)))
 
 ;; Rebuilds a trie subtree rooted at DEPTH from a flat list of
-;; (key . value) pairs with pairwise-distinct keys and length >= 2
-;; (the only case this is used for -- see merge-node's collision
-;; cases below).  Never produces the bare-pair singleton shape, which
-;; is reserved for the whole map's root.
+;; (key . value) pairs with pairwise-distinct keys and length >= 2.
+;; Never produces the bare-pair singleton shape, reserved for the
+;; map's own root.
 (define (build-node-from-entries key-hash key-equal entries depth)
   (let* ((e0 (car entries)) (e1 (cadr entries))
 	 (seed (two-entry-node depth
@@ -1025,14 +916,10 @@
 		  (node-insert key-hash key-equal (lambda (k v) v) (lambda (k new old) new)
 			       node depth h (car kv) (cdr kv))))))))
 
-;; Merges two real trie nodes (never #f, never a bare pair -- children
-;; are always real nodes, see the node-representation comment above).
-;; The common bitmap-vs-bitmap case is handled structurally by
-;; merge-bitmaps; any case touching a collision-node is resolved by
-;; flattening both sides to entry lists and rebuilding, since
-;; collision-nodes are rare and the two-bitmap structural alignment
-;; merge-bitmaps relies on does not apply once a hash is fully
-;; exhausted.
+;; Merges two real trie nodes (never #f or a bare pair). The common
+;; bitmap-vs-bitmap case is handled structurally by merge-bitmaps; any
+;; case touching a collision-node flattens both sides to entry lists
+;; and rebuilds instead.
 (define (merge-node key-hash key-equal on-left on-right on-both n1 n2 depth)
   (cond
    ((and (bitmap-node? n1) (bitmap-node? n2))
