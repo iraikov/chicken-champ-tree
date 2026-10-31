@@ -7,9 +7,9 @@
 	srfi-1 (srfi 69) champ-tree yasos-collections test)
 
 (define (generator->list g)
-  (let loop ((acc '()))
+  (let loop ((ax '()))
     (let ((x (g)))
-      (if (eof-object? x) (reverse acc) (loop (cons x acc))))))
+      (if (eof-object? x) (reverse ax) (loop (cons x ax))))))
 
 (define (++ x) (+ 1 x))
 (define (-- x) (- x 1))

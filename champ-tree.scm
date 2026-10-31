@@ -47,6 +47,9 @@
           (only srfi-1 any every) (srfi 69))
   (import-for-syntax srfi-1)
 
+  (include "box.scm")
+  (include "stack.scm")
+
 ;;
 ;; Persistent map operations
 ;;
@@ -279,19 +282,18 @@
   (if (collision-node? node)
       (if (not (fx= h (collision-node-hash node)))
 	  ;; KEY shares only the chunk-prefix down to DEPTH with this
-	  ;; collision-node's keys, not their full hash -- ordinary, not
-	  ;; an error.
+	  ;; collision-node's keys, not their full hash
 	  (split-node-vs-subtree depth (collision-node-hash node) node h key (on-new key value))
 	  (let ((entries (collision-node-entries node)))
-	    (let loop ((es entries) (acc '()))
+	    (let loop ((es entries) (ax '()))
 	      (cond
 	       ((null? es)
 		(CollisionNode h (cons (cons key (on-new key value)) entries)))
 	       ((key-equal key (car (car es)))
-		(CollisionNode h (append (reverse acc)
+		(CollisionNode h (append (reverse ax)
 					  (cons (cons key (on-conflict key value (cdr (car es))))
 						(cdr es)))))
-	       (else (loop (cdr es) (cons (car es) acc)))))))
+	       (else (loop (cdr es) (cons (car es) ax)))))))
       (let* ((datamap (bitmap-node-datamap node))
 	     (nodemap (bitmap-node-nodemap node))
 	     (array   (bitmap-node-array node))
@@ -396,16 +398,16 @@
 (define (node-delete key-hash key-equal node depth h key)
   (if (collision-node? node)
       (let ((entries (collision-node-entries node)))
-	(let loop ((es entries) (acc '()))
+	(let loop ((es entries) (ax '()))
 	  (cond
 	   ((null? es) #f)
 	   ((key-equal key (car (car es)))
-	    (let ((remaining (append (reverse acc) (cdr es))))
+	    (let ((remaining (append (reverse ax) (cdr es))))
 	      (cons (car es)
 		    (if (null? (cdr remaining))
 			(car remaining)                      ; collapse to bare pair
 			(CollisionNode (collision-node-hash node) remaining)))))
-	   (else (loop (cdr es) (cons (car es) acc))))))
+	   (else (loop (cdr es) (cons (car es) ax))))))
       (let* ((datamap (bitmap-node-datamap node))
 	     (nodemap (bitmap-node-nodemap node))
 	     (array   (bitmap-node-array node))
@@ -481,10 +483,10 @@
 	   (array   (bitmap-node-array root))
 	   (ndata   (popcount32 datamap))
 	   (nnode   (popcount32 nodemap)))
-      (let loop ((i 0) (acc ndata))
+      (let loop ((i 0) (ax ndata))
 	(if (fx= i nnode)
-	    acc
-	    (loop (fx+ i 1) (fx+ acc (get-size (vector-ref array (fx+ (fx* 2 ndata) i)))))))))))
+	    ax
+	    (loop (fx+ i 1) (fx+ ax (get-size (vector-ref array (fx+ (fx* 2 ndata) i)))))))))))
 
 (define (get-depth root)
   (cond
@@ -497,10 +499,10 @@
 	   (array   (bitmap-node-array root))
 	   (ndata   (popcount32 datamap))
 	   (nnode   (popcount32 nodemap)))
-      (let loop ((i 0) (acc 0))
+      (let loop ((i 0) (ax 0))
 	(if (fx= i nnode)
-	    (fx+ 1 acc)
-	    (loop (fx+ i 1) (fxmax acc (get-depth (vector-ref array (fx+ (fx* 2 ndata) i)))))))))))
+	    (fx+ 1 ax)
+	    (loop (fx+ i 1) (fxmax ax (get-depth (vector-ref array (fx+ (fx* 2 ndata) i)))))))))))
 
 
 ;;
@@ -567,18 +569,13 @@
 		(pull-next (push-first child (cons (Node node (fx+ slot 1)) rest)))))
 	     (else (pull-next rest)))))))))
 
-(define-record-type <box>
-  (make-box val)
-  box?
-  (val box-val box-val-set!))
-
 (define (node-generator root project)
-  (let ((b (make-box (push-first root '()))))
+  (let ((b (box (push-first root '()))))
     (lambda ()
-      (let-values (((item next-stack) (pull-next (box-val b))))
+      (let-values (((item next-stack) (pull-next (unbox b))))
 	(if (not item)
 	    (eof-object)
-	    (begin (box-val-set! b next-stack) (project item)))))))
+	    (begin (set-box! b next-stack) (project item)))))))
 
 (define (assoc-generator root) (node-generator root (lambda (item) item)))
 (define (key-generator root)   (node-generator root car))
@@ -725,11 +722,11 @@
   (let ((root (map-root m)) (key-hash (map-key-hash m)) (key-equal (map-key-equal m)))
     (and (node-valid? key-hash key-equal root 0 '() #t)
 	 ;; no duplicate keys anywhere in the whole trie
-	 (let ((keys '()) (ok #t))
+	 (let ((keys (make-stack)) (ok #t))
 	   (tree-for-each-assoc root
 	     (lambda (item)
-	       (when (any (lambda (k) (key-equal k (car item))) keys) (set! ok #f))
-	       (set! keys (cons (car item) keys))))
+	       (when (any (lambda (k) (key-equal k (car item))) (stack->list keys)) (set! ok #f))
+	       (stack-push! keys (car item))))
 	   ok))))
 
 
@@ -812,84 +809,96 @@
 (define (merge-bitmaps key-hash key-equal on-left on-right on-both n1 n2 depth)
   (let ((d1 (bitmap-node-datamap n1)) (m1 (bitmap-node-nodemap n1)) (a1 (bitmap-node-array n1))
 	(d2 (bitmap-node-datamap n2)) (m2 (bitmap-node-nodemap n2)) (a2 (bitmap-node-array n2)))
-    (let loop ((b 0) (new-datamap 0) (new-nodemap 0) (data-pairs '()) (nodes '()))
+    ;; DATA-REV holds the data run flat (key, value, key, value, ...)
+    ;; and NODES-REV the node run, both in reverse bit order.
+    (let loop ((b 0) (new-datamap 0) (new-nodemap 0) (data-rev '()) (nodes-rev '()))
       (if (fx= b 32)
-	  (BitmapNode new-datamap new-nodemap
-		      (vector-append
-		       (list->vector (apply append (map (lambda (p) (list (car p) (cdr p)))
-							 (reverse data-pairs))))
-		       (list->vector (reverse nodes))))
+	  (let* ((ndata2 (fx* 2 (popcount32 new-datamap)))
+		 (array (make-vector (fx+ ndata2 (popcount32 new-nodemap)))))
+	    ;; Both lists are in reverse order, so fill each run from its end.
+	    (let fill ((i (fx- (vector-length array) 1)) (xs nodes-rev))
+	      (unless (null? xs)
+		(vector-set! array i (car xs))
+		(fill (fx- i 1) (cdr xs))))
+	    (let fill ((i (fx- ndata2 1)) (xs data-rev))
+	      (unless (null? xs)
+		(vector-set! array i (car xs))
+		(fill (fx- i 1) (cdr xs))))
+	    (BitmapNode new-datamap new-nodemap array))
 	  (let* ((d1b (bit-set? d1 b)) (n1b (bit-set? m1 b))
 		 (d2b (bit-set? d2 b)) (n2b (bit-set? m2 b)))
 	    (cond
 	     ((and (not d1b) (not n1b) (not d2b) (not n2b))
-	      (loop (fx+ b 1) new-datamap new-nodemap data-pairs nodes))
+	      (loop (fx+ b 1) new-datamap new-nodemap data-rev nodes-rev))
 	     ((and d1b (not d2b) (not n2b))
 	      (let* ((di (data-index d1 b)) (k (vector-ref a1 di)) (v (vector-ref a1 (fx+ di 1))))
 		(loop (fx+ b 1) (fxior new-datamap (fxshl 1 b)) new-nodemap
-		      (cons (cons k (on-left k v)) data-pairs) nodes)))
+		      (cons (on-left k v) (cons k data-rev)) nodes-rev)))
 	     ((and d2b (not d1b) (not n1b))
 	      (let* ((di (data-index d2 b)) (k (vector-ref a2 di)) (v (vector-ref a2 (fx+ di 1))))
 		(loop (fx+ b 1) (fxior new-datamap (fxshl 1 b)) new-nodemap
-		      (cons (cons k (on-right k v)) data-pairs) nodes)))
+		      (cons (on-right k v) (cons k data-rev)) nodes-rev)))
 	     ((and n1b (not d2b) (not n2b))
 	      (let ((c (vector-ref a1 (node-index d1 m1 b))))
-		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-pairs
-		      (cons (clone-node-values on-left c) nodes))))
+		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-rev
+		      (cons (clone-node-values on-left c) nodes-rev))))
 	     ((and n2b (not d1b) (not n1b))
 	      (let ((c (vector-ref a2 (node-index d2 m2 b))))
-		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-pairs
-		      (cons (clone-node-values on-right c) nodes))))
+		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-rev
+		      (cons (clone-node-values on-right c) nodes-rev))))
 	     ((and d1b d2b)
 	      (let* ((di1 (data-index d1 b)) (k1 (vector-ref a1 di1)) (v1 (vector-ref a1 (fx+ di1 1)))
 		     (di2 (data-index d2 b)) (k2 (vector-ref a2 di2)) (v2 (vector-ref a2 (fx+ di2 1))))
 		(if (key-equal k1 k2)
 		    (loop (fx+ b 1) (fxior new-datamap (fxshl 1 b)) new-nodemap
-			  (cons (cons k1 (on-both k1 v1 v2)) data-pairs) nodes)
-		    (loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-pairs
+			  (cons (on-both k1 v1 v2) (cons k1 data-rev)) nodes-rev)
+		    (loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-rev
 			  (cons (two-entry-node (fx+ depth 1)
 						 (mask32 (key-hash k1)) k1 (on-left k1 v1)
 						 (mask32 (key-hash k2)) k2 (on-right k2 v2))
-				nodes)))))
+				nodes-rev)))))
 	     ((and n1b n2b)
 	      (let ((c1 (vector-ref a1 (node-index d1 m1 b))) (c2 (vector-ref a2 (node-index d2 m2 b))))
-		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-pairs
+		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-rev
 		      (cons (merge-node key-hash key-equal on-left on-right on-both c1 c2 (fx+ depth 1))
-			    nodes))))
+			    nodes-rev))))
 	     ((and d1b n2b)
 	      (let* ((di (data-index d1 b)) (k (vector-ref a1 di)) (v (vector-ref a1 (fx+ di 1)))
 		     (c (vector-ref a2 (node-index d2 m2 b))))
-		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-pairs
+		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-rev
 		      (cons (node-insert key-hash key-equal
 					 (lambda (kk vv) (on-left kk vv))
 					 (lambda (kk newv oldv) (on-both kk newv oldv))
 					 c (fx+ depth 1) (mask32 (key-hash k)) k v)
-			    nodes))))
+			    nodes-rev))))
 	     ((and n1b d2b)
 	      (let* ((di (data-index d2 b)) (k (vector-ref a2 di)) (v (vector-ref a2 (fx+ di 1)))
 		     (c (vector-ref a1 (node-index d1 m1 b))))
-		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-pairs
+		(loop (fx+ b 1) new-datamap (fxior new-nodemap (fxshl 1 b)) data-rev
 		      (cons (node-insert key-hash key-equal
 					 (lambda (kk vv) (on-right kk vv))
 					 (lambda (kk newv oldv) (on-both kk oldv newv))
 					 c (fx+ depth 1) (mask32 (key-hash k)) k v)
-			    nodes))))
+			    nodes-rev))))
 	     (else (champ-tree:error 'merge-node "impossible bit classification"))))))))
 
 
 ;; Flattens a real trie node (bitmap-node or collision-node) to its
 ;; full list of (key . value) associations.
-(define (node->entries node) (reverse (let ((acc '())) (tree-for-each-assoc node (lambda (item) (set! acc (cons item acc)))) acc)))
+(define (node->entries node)
+  (let ((s (make-stack)))
+    (tree-for-each-assoc node (lambda (item) (stack-push! s item)))
+    (reverse (stack->list s))))
 
 ;; Merges two association lists by key-equal: a key unique to XS
 ;; passes through ON-LEFT, unique to YS through ON-RIGHT, and a key in
 ;; both through ON-BOTH (key x y).
 (define (alist-merge key-equal on-left on-right on-both xs ys)
-  (let* ((ys-only (let loop ((ys ys) (acc '()))
+  (let* ((ys-only (let loop ((ys ys) (ax '()))
 		    (cond
-		     ((null? ys) acc)
-		     ((any (lambda (x) (key-equal (car x) (car (car ys)))) xs) (loop (cdr ys) acc))
-		     (else (loop (cdr ys) (cons (car ys) acc))))))
+		     ((null? ys) ax)
+		     ((any (lambda (x) (key-equal (car x) (car (car ys)))) xs) (loop (cdr ys) ax))
+		     (else (loop (cdr ys) (cons (car ys) ax))))))
 	 (left+both (map (lambda (x)
 			    (let ((match (assoc (car x) ys key-equal)))
 			      (if match
@@ -986,26 +995,26 @@
 (define (union-transform fn merge-fn)
   (lambda (m1 m2)
     (check-compatible m1 m2)
-    (let ((n 0) (kt1 '()) (kt2 '()))
+    (let ((n 0) (kt1 (make-stack)) (kt2 (make-stack)))
       (let ((root (merge-roots (map-key-hash m1) (map-key-equal m1)
 				(lambda (k x)
 				  (let ((x1 (fn x)))
 				    (set! n (fx+ 1 n))
-				    (set! kt1 (cons (cons x x1) kt1))
+				    (stack-push! kt1 (cons x x1))
 				    x1))
 				(lambda (k y)
 				  (let ((y1 (fn y)))
 				    (set! n (fx+ 1 n))
-				    (set! kt2 (cons (cons y y1) kt2))
+				    (stack-push! kt2 (cons y y1))
 				    y1))
 				(lambda (k x y)
 				  (let ((v (merge-fn x y)))
 				    (set! n (fx+ 1 n))
-				    (set! kt1 (cons (cons x v) kt1))
-				    (set! kt2 (cons (cons y v) kt2))
+				    (stack-push! kt1 (cons x v))
+				    (stack-push! kt2 (cons y v))
 				    v))
 				(map-root m1) (map-root m2))))
 	(list n (champ-tree-map (map-key-hash m1) (map-key-equal m1) new-root: root)
-	      (reverse kt1) (reverse kt2))))))
+	      (reverse (stack->list kt1)) (reverse (stack->list kt2)))))))
 
 )

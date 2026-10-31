@@ -6,6 +6,7 @@
  (dependencies datatype matchable yasos srfi-1 srfi-69)
  (test-dependencies test srfi-1 srfi-69)
  (author "Ivan Raikov")
- (components (extension champ-tree))
+ (components (extension champ-tree
+               (source-dependencies "box.scm" "stack.scm")))
  )
 
